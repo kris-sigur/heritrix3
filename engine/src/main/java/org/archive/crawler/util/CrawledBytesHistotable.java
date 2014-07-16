@@ -22,6 +22,7 @@ package org.archive.crawler.util;
 import org.apache.commons.httpclient.HttpStatus;
 import org.archive.modules.CoreAttributeConstants;
 import org.archive.modules.CrawlURI;
+import org.archive.modules.deciderules.recrawl.IdenticalDigestDecideRule;
 import org.archive.util.ArchiveUtils;
 import org.archive.util.Histotable;
 
@@ -44,7 +45,7 @@ implements CoreAttributeConstants {
         if(curi.getFetchStatus()==HttpStatus.SC_NOT_MODIFIED) {
             tally(NOTMODIFIED, curi.getContentSize());
             tally(NOTMODIFIEDCOUNT,1);
-        } else if (curi.getAnnotations().contains("duplicate:digest")) {
+        } else if (IdenticalDigestDecideRule.hasIdenticalDigest(curi)) {
             tally(DUPLICATE,curi.getContentSize());
             tally(DUPLICATECOUNT,1);
         } else {
