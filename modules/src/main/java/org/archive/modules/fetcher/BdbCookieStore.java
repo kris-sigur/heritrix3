@@ -21,18 +21,21 @@ package org.archive.modules.fetcher;
 import java.io.IOException;
 import java.io.Reader;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
 import java.util.Date;
-import java.util.Iterator;
 import java.util.List;
 
 import org.apache.http.cookie.Cookie;
+import org.apache.http.cookie.CookieIdentityComparator;
 import org.archive.bdb.BdbModule;
 import org.archive.checkpointing.Checkpoint;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.sleepycat.bind.serial.SerialBinding;
 import com.sleepycat.bind.serial.StoredClassCatalog;
-import com.sleepycat.collections.StoredSortedKeySet;
+import com.sleepycat.bind.tuple.StringBinding;
+import com.sleepycat.collections.StoredSortedMap;
 import com.sleepycat.je.Database;
 import com.sleepycat.je.DatabaseException;
 
@@ -50,7 +53,8 @@ public class BdbCookieStore extends AbstractCookieStore {
     public static String COOKIEDB_NAME = "hc_httpclient_cookies";
  
     private transient Database cookieDb;
-    private transient StoredSortedKeySet<Cookie> cookies;
+    private transient StoredSortedMap<String,Cookie> cookies;
+    private transient List<Cookie> cachedCookieList;
 
     public void prepare() {
         try {
@@ -60,10 +64,22 @@ public class BdbCookieStore extends AbstractCookieStore {
             dbConfig.setAllowCreate(true);
             cookieDb = bdb.openDatabase(COOKIEDB_NAME, dbConfig,
                     isCheckpointRecovery);
-            cookies = new StoredSortedKeySet<Cookie>(cookieDb,
-                    new SerialBinding<Cookie>(classCatalog, Cookie.class), true);
+            cookies = new StoredSortedMap<String, Cookie>(cookieDb,
+                    new StringBinding(), new SerialBinding<Cookie>(
+                            classCatalog, Cookie.class), true);
+            cachedCookieList = new ArrayList<Cookie>(cookies.values());
         } catch (DatabaseException e) {
             throw new RuntimeException(e);
+        }
+    }
+    
+    private transient Comparator<Cookie> cookieIdentityComparator = new CookieIdentityComparator();
+    protected void removeFromCachedList(Cookie c) {
+        for (int i = 0; i < cachedCookieList.size(); i++) {
+            if (cookieIdentityComparator.compare(cachedCookieList.get(i), c) == 0) {
+                cachedCookieList.remove(i);
+                break;
+            }
         }
     }
     
@@ -77,10 +93,17 @@ public class BdbCookieStore extends AbstractCookieStore {
     @Override
     public synchronized void addCookie(Cookie cookie) {
         if (cookie != null) {
+            String key = makeKey(cookie);
+            
             // first remove any old cookie that is equivalent
-            cookies.remove(cookie);
+            Cookie removed = cookies.remove(key);
+            if (removed != null) {
+                removeFromCachedList(removed);
+            }
+            
             if (!cookie.isExpired(new Date())) {
-                cookies.add(cookie);
+                cookies.put(key, cookie);
+                cachedCookieList.add(cookie);
             }
         }
     }
@@ -92,10 +115,13 @@ public class BdbCookieStore extends AbstractCookieStore {
      * @return an array of {@link Cookie cookies}.
      */
     @Override
-    public synchronized List<Cookie> getCookies() {
+    public List<Cookie> getCookies() {
+        return cachedCookieList;
+    }
+    
+    protected List<Cookie> getCookiesBypassCache() {
         if (cookies != null) {
-            //create defensive copy so it won't be concurrently modified
-            return new ArrayList<Cookie>(cookies);
+            return new ArrayList<Cookie>(cookies.values());
         } else {
             return null;
         }
@@ -115,9 +141,10 @@ public class BdbCookieStore extends AbstractCookieStore {
             return false;
         }
         boolean removed = false;
-        for (Iterator<Cookie> it = cookies.iterator(); it.hasNext();) {
-            if (it.next().isExpired(date)) {
-                it.remove();
+        for (String key: cookies.keySet()) {
+            if (cookies.get(key).isExpired(date)) {
+                Cookie c = cookies.remove(key);
+                cachedCookieList.remove(c);
                 removed = true;
             }
         }
@@ -130,6 +157,7 @@ public class BdbCookieStore extends AbstractCookieStore {
     @Override
     public synchronized void clear() {
         cookies.clear();
+        cachedCookieList.clear();
     }
 
     @Override
@@ -158,11 +186,14 @@ public class BdbCookieStore extends AbstractCookieStore {
     
     @Override
     protected void loadCookies(Reader reader) {
-        loadCookies(reader, cookies);
+        Collection<Cookie> loadedCookies = readCookies(reader);
+        for (Cookie cookie: loadedCookies) {
+            addCookie(cookie);
+        }
     }
 
     @Override
     protected void saveCookies(String absolutePath) {
-        saveCookies(absolutePath, cookies);
+        saveCookies(absolutePath, cookies.values());
     }
 }

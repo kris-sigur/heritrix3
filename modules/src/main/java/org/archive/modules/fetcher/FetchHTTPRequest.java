@@ -46,6 +46,7 @@ import javax.net.ssl.SSLSocket;
 import org.apache.commons.httpclient.URIException;
 import org.apache.commons.lang.StringUtils;
 import org.apache.http.HttpEntityEnclosingRequest;
+import org.apache.http.HttpException;
 import org.apache.http.HttpHeaders;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpRequest;
@@ -63,6 +64,7 @@ import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.AbstractExecutionAwareRequest;
 import org.apache.http.client.protocol.HttpClientContext;
+import org.apache.http.client.utils.URLEncodedUtils;
 import org.apache.http.config.ConnectionConfig;
 import org.apache.http.config.MessageConstraints;
 import org.apache.http.config.Registry;
@@ -72,23 +74,29 @@ import org.apache.http.conn.DnsResolver;
 import org.apache.http.conn.HttpClientConnectionManager;
 import org.apache.http.conn.ManagedHttpClientConnection;
 import org.apache.http.conn.routing.HttpRoute;
+import org.apache.http.conn.routing.HttpRoutePlanner;
 import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.socket.PlainConnectionSocketFactory;
 import org.apache.http.conn.ssl.AllowAllHostnameVerifier;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.entity.ContentLengthStrategy;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.DefaultBHttpClientConnection;
 import org.apache.http.impl.client.BasicAuthCache;
 import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.conn.BasicHttpClientConnectionManager;
 import org.apache.http.impl.conn.DefaultHttpResponseParserFactory;
 import org.apache.http.impl.conn.ManagedHttpClientConnectionFactory;
-import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.apache.http.impl.io.DefaultHttpRequestWriterFactory;
 import org.apache.http.io.HttpMessageParserFactory;
 import org.apache.http.io.HttpMessageWriterFactory;
 import org.apache.http.message.BasicNameValuePair;
 import org.apache.http.protocol.HTTP;
+import org.apache.http.protocol.HttpContext;
+import org.apache.http.util.Args;
+import org.archive.modules.CoreAttributeConstants;
 import org.archive.modules.CrawlURI;
 import org.archive.modules.CrawlURI.FetchType;
 import org.archive.modules.Processor;
@@ -144,6 +152,8 @@ class FetchHTTPRequest {
     protected HttpHost targetHost;
     protected boolean addedCredentials;
     protected HttpHost proxyHost;
+    // make this a member variable so it doesn't get gc'd prematurely
+    protected HttpClientConnectionManager connMan;
 
     public FetchHTTPRequest(FetchHTTP fetcher, CrawlURI curi) throws URIException {
         this.fetcher = fetcher;
@@ -165,12 +175,20 @@ class FetchHTTPRequest {
             this.requestConfigBuilder.setProxy(this.proxyHost);
             requestLineUri = curi.getUURI().toString();
         } else {
-            requestLineUri = curi.getUURI().getPathQuery();
+            requestLineUri = curi.getUURI().getEscapedPathQuery();
         }
 
         if (curi.getFetchType() == FetchType.HTTP_POST) {
-            this.request = new BasicExecutionAwareEntityEnclosingRequest("POST", 
-                    requestLineUri, httpVersion);
+            BasicExecutionAwareEntityEnclosingRequest postRequest = new BasicExecutionAwareEntityEnclosingRequest(
+                    "POST", requestLineUri, httpVersion);
+            this.request = postRequest;
+            String submitData = (String) curi.getData().get(CoreAttributeConstants.A_SUBMIT_DATA);
+            if (submitData != null) {
+                // XXX brittle, doesn't support multipart form data etc
+                ContentType contentType = ContentType.create(URLEncodedUtils.CONTENT_TYPE, "UTF-8");
+                StringEntity formEntity = new StringEntity(submitData, contentType);
+                postRequest.setEntity(formEntity);
+            }
         } else {
             this.request = new BasicExecutionAwareRequest("GET", 
                     requestLineUri, httpVersion);
@@ -190,7 +208,7 @@ class FetchHTTPRequest {
         this.addedCredentials = populateTargetCredential();
         populateHttpProxyCredential();
     }
-    
+
     protected void configureRequestHeaders() {
         if (fetcher.getAcceptCompression()) {
             request.addHeader("Accept-Encoding", "gzip,deflate");
@@ -236,6 +254,14 @@ class FetchHTTPRequest {
                 request.addHeader(nameValue[0], nameValue[1]);
             } else {
                 logger.warning("Invalid accept header: " + headerString);
+            }
+        }
+        
+        @SuppressWarnings("unchecked")
+        Map<String, String> uriCustomHeaders = (Map<String, String>) curi.getData().get("customHttpRequestHeaders");
+        if (uriCustomHeaders != null) {
+            for (Entry<String, String> h: uriCustomHeaders.entrySet()) {
+                request.setHeader(h.getKey(), h.getValue());
             }
         }
     }
@@ -423,8 +449,8 @@ class FetchHTTPRequest {
         
         httpClientBuilder.setDefaultCookieStore(fetcher.getCookieStore());
         
-        HttpClientConnectionManager connManager = buildConnectionManager();
-        httpClientBuilder.setConnectionManager(connManager);
+        connMan = buildConnectionManager();
+        httpClientBuilder.setConnectionManager(connMan);
     }
 
     protected HttpClientConnectionManager buildConnectionManager() {
@@ -464,11 +490,12 @@ class FetchHTTPRequest {
                         DefaultHttpResponseParserFactory.INSTANCE);
             }
         };
-        PoolingHttpClientConnectionManager connMan = new PoolingHttpClientConnectionManager(socketFactoryRegistry, connFactory, dnsResolver);
+        BasicHttpClientConnectionManager connMan = new BasicHttpClientConnectionManager(
+                socketFactoryRegistry, connFactory, null, dnsResolver);
         
         SocketConfig.Builder socketConfigBuilder = SocketConfig.custom();
         socketConfigBuilder.setSoTimeout(fetcher.getSoTimeoutMs());
-        connMan.setDefaultSocketConfig(socketConfigBuilder.build());
+        connMan.setSocketConfig(socketConfigBuilder.build());
         
         return connMan;
     }
@@ -552,6 +579,36 @@ class FetchHTTPRequest {
         }
     }
     
+    protected static final HttpRoutePlanner ROUTE_PLANNER = new HttpRoutePlanner() {
+        @Override
+        public HttpRoute determineRoute(HttpHost host, HttpRequest request,
+                HttpContext context) throws HttpException {
+            Args.notNull(host, "Target host");
+            Args.notNull(request, "Request");
+            final HttpClientContext clientContext = HttpClientContext.adapt(context);
+            final RequestConfig config = clientContext.getRequestConfig();
+            final InetAddress local = config.getLocalAddress();
+            HttpHost proxy = config.getProxy();
+
+            final HttpHost target;
+            if (host.getPort() > 0
+                    && (host.getSchemeName().equalsIgnoreCase("http") && host.getPort() == 80
+                    || host.getSchemeName().equalsIgnoreCase("https") && host.getPort() == 443)) {
+                target = new HttpHost(host.getHostName(), -1, host.getSchemeName());
+            } else {
+                target = host;
+            }
+            final boolean secure = target.getSchemeName().equalsIgnoreCase("https");
+            if (proxy == null) {
+                return new HttpRoute(target, local, secure);
+            } else {
+                return new HttpRoute(target, local, proxy, secure);
+            }
+
+        }
+        
+    };
+    
     protected void initHttpClientBuilder() {
         httpClientBuilder = HttpClientBuilder.create();
         
@@ -562,6 +619,8 @@ class FetchHTTPRequest {
         
         // we handle redirects manually
         httpClientBuilder.disableRedirectHandling();
+        
+        httpClientBuilder.setRoutePlanner(ROUTE_PLANNER);
     }
     
     public HttpResponse execute() throws ClientProtocolException, IOException {
