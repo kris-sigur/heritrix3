@@ -118,6 +118,11 @@ public class CrawlHost implements Serializable, FetchStats.HasFetchStats, Identi
      * forever (is a numeric IP).
      */
     public void setIP(InetAddress address, long ttl) {
+    	if ("0.0.0.0".equals(address.getHostAddress())) {
+            logger.finest("Ignoring 0.0.0.0 IP value for " + hostname);
+            return;
+        }
+
         this.ip = address;
         // Assume that a lookup as occurred by the time
         // a caller decides to set this (even to null)

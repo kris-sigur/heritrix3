@@ -100,18 +100,13 @@ public class DefaultServerCache extends ServerCache implements Closeable, Serial
         if (hostname == null || hostname.length() == 0) {
             return null;
         }
-        CrawlHost host = hosts.getOrUse(
+        return hosts.getOrUse(
                 hostname,
                 new Supplier<CrawlHost>() {
+                	@Override
                     public CrawlHost get() {
-                        String hkey = new String(hostname); // ensure private minimal key
-                        return new CrawlHost(hkey);
+                        return new CrawlHost(hostname);
                     }});
-        if (host != null && host.getIP() != null
-                && "0.0.0.0".equals(host.getIP().getHostAddress())) {
-            throw new IllegalStateException("got suspicious value 0.0.0.0 for " + hostname);
-        }
-        return host;
     }
 
     /**
